@@ -200,25 +200,32 @@ jobs:
             file "$binary"
 
             # 防止错误架构的二进制被打进安装包
-            local expected_machine
-
+            # 使用 file 的实际输出检查 ELF 架构
+            local binary_info
+            binary_info="$(file -b "$binary")"
+            
             case "$arch" in
               x86_64)
-                expected_machine="Advanced Micro Devices X86-64"
+                if ! printf '%s\n' "$binary_info" | grep -Eq 'x86-64|X86-64'; then
+                  echo "Unexpected binary architecture for x86_64"
+                  echo "$binary_info"
+                  exit 1
+                fi
                 ;;
               aarch64)
-                expected_machine="AArch64"
+                if ! printf '%s\n' "$binary_info" | grep -Eq 'aarch64|AArch64'; then
+                  echo "Unexpected binary architecture for aarch64"
+                  echo "$binary_info"
+                  exit 1
+                fi
                 ;;
               *)
                 echo "Unsupported architecture: $arch"
                 exit 1
                 ;;
             esac
-
-            if ! file "$binary" | grep -Fq "$expected_machine"; then
-              echo "Unexpected binary architecture for $arch"
-              exit 1
-            fi
+            
+            echo "Architecture verified: $arch"
 
             # Debian 文件系统布局
             install -D -m 0755 "$binary" \
