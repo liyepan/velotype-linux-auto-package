@@ -1,0 +1,164 @@
+name: Package Velotype latest (deb/rpm)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      version_no_v: ${{ steps.get_version.outputs.version_no_v }}
+    steps:
+      - id: get_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release view --repo manyougz/velotype --json tagName -q .tagName)
+          [ -n "$TAG" ] || { echo "Failed to get latest tag"; exit 1; }
+          echo "Latest upstream tag: $TAG"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build-packages:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+            nfpm_arch: amd64
+          - arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+            nfpm_arch: arm64
+    env:
+      VERSION: ${{ needs.setup.outputs.version }}
+      VERSION_NO_V: ${{ needs.setup.outputs.version_no_v }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Velotype Linux asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ./downloaded ./extracted ./pkgroot/usr/bin
+          ASSET="velotype-${VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          echo "Downloading $ASSET from tag $VERSION"
+          gh release download "$VERSION" \
+            --repo manyougz/velotype \
+            --pattern "$ASSET" \
+            --dir ./downloaded
+
+      - name: Verify SHA256 (if upstream provides digest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GitHub 现在会在 release assets 中提供 digest 字段（sha256:xxx）
+          DIGEST=$(gh release view "$VERSION" --repo manyougz/velotype \
+            --json assets \
+            -q ".assets[] | select(.name==\"${ASSET}\") | .digest")
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "No upstream digest available, skipping verification"
+            exit 0
+          fi
+          EXPECTED="${DIGEST#sha256:}"
+          ACTUAL=$(sha256sum "./downloaded/${ASSET}" | cut -d' ' -f1)
+          echo "expected=$EXPECTED"
+          echo "actual  =$ACTUAL"
+          [ "$ACTUAL" = "$EXPECTED" ] || { echo "SHA256 mismatch"; exit 1; }
+
+      - name: Extract binary
+        run: |
+          tar -xzf "./downloaded/${ASSET}" -C ./extracted
+          BIN=$(find ./extracted -type f -name velotype | head -n1)
+          [ -n "$BIN" ] || { echo "velotype binary not found in archive"; exit 1; }
+          cp "$BIN" ./pkgroot/usr/bin/velotype
+          chmod +x ./pkgroot/usr/bin/velotype
+
+      - name: Prepare nfpm config
+        run: |
+          cat > nfpm.yaml <<EOF
+          name: "velotype"
+          arch: "${{ matrix.nfpm_arch }}"
+          platform: "linux"
+          version: "${VERSION_NO_V}"
+          section: "editors"
+          priority: "optional"
+          maintainer: "Your Name <you@example.com>"
+          description: "Velotype ${VERSION} — native Rust + GPUI Markdown editor (repackaged)"
+          homepage: "https://github.com/manyougz/velotype"
+          license: "Apache-2.0"
+          contents:
+            - src: ./pkgroot/usr/bin/velotype
+              dst: /usr/bin/velotype
+              file_info:
+                mode: 0755
+          depends:
+            - libfontconfig1
+            - libfreetype6
+            - libxkbcommon0
+            - libwayland-client0
+            - libxkbcommon-x11-0
+          EOF
+
+      - name: Build .deb
+        uses: blinktag/nfpm@v2.27.1
+        with:
+          config: nfpm.yaml
+          packager: deb
+          target: velotype_${{ needs.setup.outputs.version_no_v }}_${{ matrix.deb_arch }}.deb
+
+      - name: Build .rpm
+        uses: blinktag/nfpm@v2.27.1
+        with:
+          config: nfpm.yaml
+          packager: rpm
+          target: velotype-${{ needs.setup.outputs.version_no_v }}-1.${{ matrix.rpm_arch }}.rpm
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velotype-${{ needs.setup.outputs.version }}-${{ matrix.arch }}-packages
+          path: |
+            velotype_${{ needs.setup.outputs.version_no_v }}_${{ matrix.deb_arch }}.deb
+            velotype-${{ needs.setup.outputs.version_no_v }}-1.${{ matrix.rpm_arch }}.rpm
+
+  publish-release:
+    needs: [setup, build-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh ./artifacts
+
+      - name: Upload to your Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.version }}
+          name: "Velotype ${{ needs.setup.outputs.version }} (repackaged)"
+          body: |
+            Repackaged from upstream [manyougz/velotype@${{ needs.setup.outputs.version }}](https://github.com/manyougz/velotype/releases/tag/${{ needs.setup.outputs.version }}).
+
+            Generated from the official upstream Linux `tar.gz` binaries using nFPM.
+          files: |
+            ./artifacts/velotype_${{ needs.setup.outputs.version_no_v }}_amd64.deb
+            ./artifacts/velotype_${{ needs.setup.outputs.version_no_v }}_arm64.deb
+            ./artifacts/velotype-${{ needs.setup.outputs.version_no_v }}-1.x86_64.rpm
+            ./artifacts/velotype-${{ needs.setup.outputs.version_no_v }}-1.aarch64.rpm
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
