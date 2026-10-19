@@ -1,11 +1,9 @@
-name: Package Velotype for Linux
+name: Package Velotype for Linux x86_64
 
 on:
-  # 每 6 小时检查一次上游是否发布了新版本
   schedule:
     - cron: "17 */6 * * *"
 
-  # 支持手动触发
   workflow_dispatch:
 
 permissions:
@@ -17,17 +15,25 @@ concurrency:
 
 jobs:
   package:
-    name: Download and package Linux releases
+    name: Build DEB and RPM
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout packaging repository
+      # ============================================================
+      # 1. 检出自己的打包仓库
+      # ============================================================
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install packaging tools
+      # ============================================================
+      # 2. 安装打包工具
+      # ============================================================
+      - name: Install dependencies
         run: |
           set -eu
+
           sudo apt-get update
+
           sudo apt-get install -y \
             curl \
             jq \
@@ -35,8 +41,12 @@ jobs:
             tar \
             dpkg-dev \
             rpm \
-            file
+            file \
+            binutils
 
+      # ============================================================
+      # 3. 获取上游最新 Release
+      # ============================================================
       - name: Get latest upstream release
         id: release
         env:
@@ -47,106 +57,190 @@ jobs:
           API_URL="https://api.github.com/repos/manyougz/velotype/releases/latest"
 
           curl -fsSL \
+            --retry 3 \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${API_URL}" \
+            "$API_URL" \
             -o release.json
 
           TAG="$(jq -er '.tag_name' release.json)"
           VERSION="${TAG#v}"
 
-          # 防止上游版本号被用作意外的路径或文件名
-          if ! printf '%s' "$VERSION" |
+          if ! printf '%s\n' "$VERSION" |
                grep -Eq '^[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z.-]+)?$'; then
-            echo "Invalid upstream version: $VERSION"
+            echo "Invalid version: $VERSION"
             exit 1
           fi
 
+          ASSET="velotype-${TAG}-linux-x86_64.tar.gz"
+
+          # 确认最新 Release 包含 x86_64 Linux 资产
+          jq -e --arg name "$ASSET" \
+            '.assets[] | select(.name == $name)' \
+            release.json >/dev/null
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-          echo "Upstream release: $TAG"
+          echo "Upstream tag: $TAG"
+          echo "Version: $VERSION"
+          echo "Asset: $ASSET"
 
-          jq -r '.assets[] | "\(.name) \(.digest // "no-digest")"' \
-            release.json
-
-      - name: Download and verify Linux archives
+      # ============================================================
+      # 4. 下载并验证上游压缩包
+      # ============================================================
+      - name: Download upstream release
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+          ASSET: ${{ steps.release.outputs.asset }}
         run: |
           set -eu
 
           mkdir -p downloads
 
-          download_asset() {
-            local asset_name="$1"
-            local output="downloads/$1"
+          URL="$(jq -er \
+            --arg name "$ASSET" \
+            '.assets[] | select(.name == $name) | .browser_download_url' \
+            release.json)"
 
-            local asset_url
-            local digest
+          EXPECTED="$(jq -r \
+            --arg name "$ASSET" \
+            '.assets[] | select(.name == $name) | .digest // empty' \
+            release.json)"
 
-            asset_url="$(jq -er \
-              --arg name "$asset_name" \
-              '.assets[] | select(.name == $name) | .browser_download_url' \
-              release.json)"
+          # 兼容上游没有提供 digest 的情况
+          if [ -z "$EXPECTED" ] && [ "$UPSTREAM_TAG" = "v0.7.8" ]; then
+            EXPECTED="sha256:d829d560f270bd9088fa4db24100373241841f02742b954309e47d3e85f65378"
+          fi
 
-            digest="$(jq -r \
-              --arg name "$asset_name" \
-              '.assets[] | select(.name == $name) | .digest // empty' \
-              release.json)"
+          ARCHIVE="downloads/$ASSET"
 
-            echo "Downloading: $asset_name"
+          curl -fLsS \
+            --retry 3 \
+            --retry-delay 2 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "$URL" \
+            -o "$ARCHIVE"
 
-            curl -fL --retry 3 --retry-delay 2 \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "$asset_url" \
-              -o "$output"
+          if [ -n "$EXPECTED" ]; then
+            case "$EXPECTED" in
+              sha256:*)
+                EXPECTED="${EXPECTED#sha256:}"
+                ;;
+              *)
+                echo "Unsupported digest: $EXPECTED"
+                exit 1
+                ;;
+            esac
 
-            if [ -n "$digest" ]; then
-              case "$digest" in
-                sha256:*)
-                  expected="${digest#sha256:}"
-                  actual="$(sha256sum "$output" | awk '{print $1}')"
+            ACTUAL="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
 
-                  if [ "$actual" != "$expected" ]; then
-                    echo "SHA-256 mismatch: $asset_name"
-                    echo "Expected: $expected"
-                    echo "Actual:   $actual"
-                    exit 1
-                  fi
-
-                  echo "SHA-256 verified: $asset_name"
-                  ;;
-                *)
-                  echo "Unsupported digest format: $digest"
-                  exit 1
-                  ;;
-              esac
-            else
-              echo "WARNING: Upstream does not publish a digest for $asset_name"
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "SHA-256 verification failed"
+              echo "Expected: $EXPECTED"
+              echo "Actual:   $ACTUAL"
+              exit 1
             fi
-          }
 
-          download_asset "velotype-${UPSTREAM_TAG}-linux-x86_64.tar.gz"
-          download_asset "velotype-${UPSTREAM_TAG}-linux-aarch64.tar.gz"
+            echo "SHA-256 verified"
+          else
+            echo "WARNING: Upstream has no SHA-256 digest."
+          fi
 
-      - name: Prepare package metadata
-        id: metadata
+          tar -tzf "$ARCHIVE" >/dev/null
+
+      # ============================================================
+      # 5. 解压并检查上游文件
+      # ============================================================
+      - name: Extract and verify binary
         env:
-          VERSION: ${{ steps.release.outputs.version }}
-          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+          ASSET: ${{ steps.release.outputs.asset }}
         run: |
           set -eu
 
-          mkdir -p work output
+          mkdir -p work/extract
 
-          curl -fsSL \
-            "https://raw.githubusercontent.com/manyougz/velotype/${UPSTREAM_TAG}/LICENSE-APACHE" \
-            -o work/copyright
+          tar -xzf "downloads/$ASSET" \
+            -C work/extract
 
-          cat > work/velotype.desktop <<'EOF'
+          # 根据已知上游目录结构定位程序
+          BINARY="$(find work/extract \
+            -type f -name velotype -print -quit)"
+
+          if [ -z "$BINARY" ]; then
+            echo "Cannot find velotype executable"
+            find work/extract -maxdepth 4 -type f -print
+            exit 1
+          fi
+
+          # 确认 ELF 文件确实为 x86_64
+          ELF_MACHINE="$(readelf -h "$BINARY" |
+            awk -F: '/Machine:/ {
+              sub(/^[[:space:]]+/, "", $2)
+              print $2
+            }')"
+
+          echo "ELF machine: $ELF_MACHINE"
+
+          if [ "$ELF_MACHINE" != "Advanced Micro Devices X86-64" ]; then
+            echo "Unexpected ELF architecture"
+            exit 1
+          fi
+
+          chmod 0755 "$BINARY"
+
+          echo "Binary verified: $BINARY"
+
+      # ============================================================
+      # 6. 准备通用安装文件
+      # ============================================================
+      - name: Prepare package files
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+
+          mkdir -p \
+            work/payload/opt/velotype \
+            work/payload/usr/bin \
+            work/payload/usr/share/applications \
+            work/payload/usr/share/doc/velotype \
+            output
+
+          BINARY="$(find work/extract \
+            -type f -name velotype -print -quit)"
+
+          # 保留上游程序的目录布局
+          cp -a "$(dirname "$BINARY")/." \
+            work/payload/opt/velotype/
+
+          chmod 0755 work/payload/opt/velotype/velotype
+
+          # 创建统一启动入口
+          cat > work/payload/usr/bin/velotype <<'EOF'
+          #!/bin/sh
+          exec /opt/velotype/velotype "$@"
+          EOF
+
+          chmod 0755 work/payload/usr/bin/velotype
+
+          # 使用上游许可证
+          LICENSE="$(find work/extract \
+            -type f -name LICENSE-APACHE -print -quit)"
+
+          if [ -n "$LICENSE" ]; then
+            install -m 0644 "$LICENSE" \
+              work/payload/usr/share/doc/velotype/copyright
+          else
+            echo "Upstream LICENSE-APACHE not found"
+            exit 1
+          fi
+
+          # 桌面启动器
+          cat > work/payload/usr/share/applications/velotype.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
           Name=Velotype
@@ -158,182 +252,145 @@ jobs:
           StartupNotify=true
           EOF
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package files prepared"
 
-      - name: Build DEB and RPM packages
+      # ============================================================
+      # 7. 构建 DEB
+      # ============================================================
+      - name: Build DEB package
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+
+          ROOT="$PWD/work/deb-root"
+
+          mkdir -p "$ROOT"
+
+          cp -a work/payload/. "$ROOT/"
+
+          mkdir -p "$ROOT/DEBIAN"
+
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: velotype
+          Version: ${VERSION}
+          Section: editors
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Velotype Package Maintainers
+          Homepage: https://github.com/manyougz/velotype
+          Description: Native Markdown editor
+           Velotype is a native Markdown editor.
+          EOF
+
+          dpkg-deb \
+            --root-owner-group \
+            --build \
+            "$ROOT" \
+            "output/velotype_${VERSION}_amd64.deb"
+
+          echo "DEB package created"
+
+      # ============================================================
+      # 8. 构建 RPM
+      # ============================================================
+      - name: Build RPM package
         env:
           VERSION: ${{ steps.release.outputs.version }}
           UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -eu
 
-          build_package() {
-            local arch="$1"
-            local deb_arch="$2"
-            local rpm_arch="$3"
+          RPMROOT="$PWD/work/rpmbuild"
 
-            local archive="downloads/velotype-${UPSTREAM_TAG}-linux-${arch}.tar.gz"
-            local extract_dir="$PWD/work/extract-${arch}"
-            local root="$PWD/work/root-${arch}"
+          mkdir -p \
+            "$RPMROOT/BUILD" \
+            "$RPMROOT/BUILDROOT" \
+            "$RPMROOT/RPMS" \
+            "$RPMROOT/SOURCES" \
+            "$RPMROOT/SPECS" \
+            "$RPMROOT/SRPMS"
 
-            echo "========================================"
-            echo "Packaging $arch"
-            echo "========================================"
+          # RPM 使用同一套文件布局
+          tar -czf "$RPMROOT/SOURCES/payload.tar.gz" \
+            -C work/payload .
 
-            mkdir -p "$extract_dir" "$root"
-
-            # 确认压缩包结构正常后再解压
-            tar -tzf "$archive" >/dev/null
-            tar -xzf "$archive" -C "$extract_dir"
-
-            # 上游 README 声明 Linux 版本为独立可执行文件。
-            # 不依赖具体的压缩包内部目录结构。
-            local binary
-            binary="$(find "$extract_dir" -type f -executable -print -quit)"
-
-            if [ -z "$binary" ]; then
-              echo "No executable found in $archive"
-              find "$extract_dir" -maxdepth 3 -type f -print
-              exit 1
-            fi
-
-            file "$binary"
-
-            # 防止错误架构的二进制被打进安装包
-            # 使用 file 的实际输出检查 ELF 架构
-            local binary_info
-            binary_info="$(file -b "$binary")"
-            
-            case "$arch" in
-              x86_64)
-                if ! printf '%s\n' "$binary_info" | grep -Eq 'x86-64|X86-64'; then
-                  echo "Unexpected binary architecture for x86_64"
-                  echo "$binary_info"
-                  exit 1
-                fi
-                ;;
-              aarch64)
-                if ! printf '%s\n' "$binary_info" | grep -Eq 'aarch64|AArch64'; then
-                  echo "Unexpected binary architecture for aarch64"
-                  echo "$binary_info"
-                  exit 1
-                fi
-                ;;
-              *)
-                echo "Unsupported architecture: $arch"
-                exit 1
-                ;;
-            esac
-            
-            echo "Architecture verified: $arch"
-
-            # Debian 文件系统布局
-            install -D -m 0755 "$binary" \
-              "$root/usr/bin/velotype"
-
-            install -D -m 0644 work/velotype.desktop \
-              "$root/usr/share/applications/velotype.desktop"
-
-            install -D -m 0644 work/copyright \
-              "$root/usr/share/doc/velotype/copyright"
-
-            mkdir -p "$root/DEBIAN"
-
-            cat > "$root/DEBIAN/control" <<EOF
-          Package: velotype
-          Version: ${VERSION}
-          Section: editors
-          Priority: optional
-          Architecture: ${deb_arch}
-          Maintainer: Velotype Package Maintainers
-          Homepage: https://github.com/manyougz/velotype
-          Depends: libc6, libgcc-s1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libegl1, libfontconfig1
-          Description: Native Markdown editor
-           Velotype is a native Markdown editor supporting WYSIWYG
-           editing and Markdown source editing.
-          EOF
-
-            local deb_file="output/velotype_${VERSION}_${deb_arch}.deb"
-
-            dpkg-deb --root-owner-group \
-              --build "$root" "$deb_file"
-
-            # RPM 文件系统布局
-            local rpm_top="$PWD/work/rpmbuild-${arch}"
-
-            mkdir -p \
-              "$rpm_top/BUILD" \
-              "$rpm_top/BUILDROOT" \
-              "$rpm_top/RPMS" \
-              "$rpm_top/SOURCES" \
-              "$rpm_top/SPECS" \
-              "$rpm_top/SRPMS"
-
-            install -m 0755 "$binary" \
-              "$rpm_top/SOURCES/velotype"
-
-            install -m 0644 work/velotype.desktop \
-              "$rpm_top/SOURCES/velotype.desktop"
-
-            install -m 0644 work/copyright \
-              "$rpm_top/SOURCES/copyright"
-
-            cat > "$rpm_top/SPECS/velotype.spec" <<EOF
+          cat > "$RPMROOT/SPECS/velotype.spec" <<EOF
           Name:           velotype
           Version:        ${VERSION}
           Release:        1
           Summary:        Native Markdown editor
           License:        Apache-2.0
           URL:            https://github.com/manyougz/velotype
-          Source0:        velotype
-          Source1:        velotype.desktop
-          Source2:        copyright
-          BuildArch:      ${rpm_arch}
+          Source0:        payload.tar.gz
+          BuildArch:      x86_64
 
           %description
-          Velotype is a native Markdown editor supporting WYSIWYG
-          editing and Markdown source editing.
+          Velotype is a native Markdown editor.
+
+          %prep
+          %setup -q -c -T
+          tar -xzf %{SOURCE0}
+
+          %build
 
           %install
-          install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/velotype
-          install -D -m 0644 %{SOURCE1} %{buildroot}%{_datadir}/applications/velotype.desktop
-          install -D -m 0644 %{SOURCE2} %{buildroot}%{_datadir}/licenses/velotype/LICENSE-APACHE
+          mkdir -p %{buildroot}
+          cp -a . %{buildroot}/
 
           %files
-          %{_bindir}/velotype
-          %{_datadir}/applications/velotype.desktop
-          %{_datadir}/licenses/velotype/LICENSE-APACHE
+          /opt/velotype/
+          /usr/bin/velotype
+          /usr/share/applications/velotype.desktop
+          /usr/share/doc/velotype/copyright
 
           %changelog
           * Mon Oct 19 2026 Velotype Package Maintainers
           - Package upstream release ${UPSTREAM_TAG}
           EOF
 
-            rpmbuild -bb \
-              --define "_topdir $rpm_top" \
-              "$rpm_top/SPECS/velotype.spec"
+          rpmbuild -bb \
+            --target x86_64 \
+            --define "_topdir $RPMROOT" \
+            "$RPMROOT/SPECS/velotype.spec"
 
-            find "$rpm_top/RPMS" -type f -name '*.rpm' \
-              -exec cp {} output/ \;
+          find "$RPMROOT/RPMS" \
+            -type f -name '*.rpm' \
+            -exec cp {} output/ \;
 
-            echo "Packages created for $arch"
-          }
+          echo "RPM package created"
 
-          build_package x86_64 amd64 x86_64
-          build_package aarch64 arm64 aarch64
+      # ============================================================
+      # 9. 检查安装包
+      # ============================================================
+      - name: Verify packages
+        run: |
+          set -eu
 
-          echo "========================================"
           echo "Generated packages:"
           ls -lh output/
 
-      - name: Generate SHA-256 checksums
-        run: |
-          set -eu
+          DEB="$(find output -maxdepth 1 -name '*.deb' -print -quit)"
+          RPM="$(find output -maxdepth 1 -name '*.rpm' -print -quit)"
+
+          test -n "$DEB"
+          test -n "$RPM"
+
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB"
+
+          rpm -qip "$RPM"
+          rpm -qlp "$RPM"
+
           cd output
           sha256sum *.deb *.rpm > SHA256SUMS
+
           cat SHA256SUMS
 
-      - name: Publish packages to repository Releases
+      # ============================================================
+      # 10. 发布到自己的 GitHub Release
+      # ============================================================
+      - name: Publish packages
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.release.outputs.version }}
@@ -341,9 +398,7 @@ jobs:
         run: |
           set -eu
 
-          # 使用独立标签，避免与上游版本标签混淆
           PACKAGE_TAG="velotype-${UPSTREAM_TAG}"
-          TITLE="Velotype ${UPSTREAM_TAG} Linux Packages"
 
           if gh release view "$PACKAGE_TAG" \
               --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -354,20 +409,20 @@ jobs:
 
             gh release create "$PACKAGE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$TITLE" \
-              --notes "Linux DEB/RPM packages for upstream Velotype ${UPSTREAM_TAG}.
+              --title "Velotype ${UPSTREAM_TAG} Linux x86_64 Packages" \
+              --notes "Linux x86_64 DEB and RPM packages for Velotype ${UPSTREAM_TAG}.
 
-          Upstream: https://github.com/manyougz/velotype/releases/tag/${UPSTREAM_TAG}
+          Upstream:
+          https://github.com/manyougz/velotype/releases/tag/${UPSTREAM_TAG}
 
-          Architectures:
-          - x86_64 / amd64
-          - aarch64 / arm64
+          Architecture: x86_64
 
-          Packages are generated from upstream prebuilt Linux binaries."
+          Packages:
+          - Debian/Ubuntu amd64
+          - Fedora/RHEL x86_64"
 
           fi
 
-          # 同一上游版本重复运行时，更新已有安装包
           gh release upload "$PACKAGE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
@@ -375,4 +430,4 @@ jobs:
             output/*.rpm \
             output/SHA256SUMS
 
-          echo "Published: $PACKAGE_TAG"
+          echo "Published Release: $PACKAGE_TAG"
